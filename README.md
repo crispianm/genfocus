@@ -29,11 +29,11 @@ with co-registered ground-truth focus maps.
 │   └── run_render.sh
 ├── Genfocus/                  # GenFocus core (FLUX pipeline + LoRA engine)
 │   └── pipeline/flux.py
-├── Video-Depth-Anything/      # VDA model (cloned repo)
-├── checkpoints/               # Model weights
+├── Video-Depth-Anything/      # (external) VDA repo clone (ignored by git)
+├── checkpoints/               # (local) downloaded weights (ignored by git)
 │   └── metric_video_depth_anything_vitl.pth
-├── bokehNet.safetensors       # BokehNet LoRA weights
-├── deblurNet.safetensors      # DeblurNet LoRA weights
+├── bokehNet.safetensors       # (local) BokehNet LoRA weights (ignored by git)
+├── deblurNet.safetensors      # (local) DeblurNet LoRA weights (ignored by git)
 ├── data/                      # Raw input frames (scene_id/frame_XXXX.png)
 ├── output/                    # Pipeline output (see "Output Format" below)
 ├── old/                       # Archived original scripts (demo, video tools)
