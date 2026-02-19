@@ -107,7 +107,7 @@ python scripts/05_render_and_labels.py \
     --scene_index   "$SCENE_INDEX" \
     --scene_idx     "$BEAR_IDX" \
     --max_coc       "$MAX_COC" \
-    --n_sets        2 \
+    --n_sets        1 \
     --steps         30 \
     --model_id      black-forest-labs/FLUX.1-dev \
     --lora_path     . \

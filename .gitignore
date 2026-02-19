@@ -16,3 +16,5 @@ __pycache__/
 *.ckpt
 *.pt
 *.pth
+comparison_frames/
+create_comparison.py
