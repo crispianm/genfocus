@@ -24,8 +24,12 @@ conda activate genfocus
 
 cd /projects/b5dh/Genfocus
 
-export OUT_ROOT=./output
+# Each run is saved in its own timestamped directory so outputs are never
+# overwritten across repeated executions.
+RUN_ID=$(date +%Y%m%d_%H%M%S)
+export OUT_ROOT=./output/runs/run_${RUN_ID}
 export RAW_ROOT=./data
+# SCENE_INDEX comes from Phase 1 which lives in the shared ./output root.
 export SCENE_INDEX=./output/scene_index.json
 
 BEAR_IDX=0   # 'bear' is index 0 in sorted(scene_index.keys())
@@ -33,6 +37,8 @@ mkdir -p logs
 
 echo "======================================================"
 echo " Pipeline test: bear scene"
+echo " Run ID:  ${RUN_ID}"
+echo " Out dir: ${OUT_ROOT}"
 echo " Started: $(date)"
 echo " Node:    $(hostname)"
 echo " GPU:     $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
