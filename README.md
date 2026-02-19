@@ -70,18 +70,27 @@ sbatch scripts/00_setup_env.sh
 # or set up manually — see Project Overhaul.md Phase 0
 ```
 
-### 2. Download Weights
+### 2. Rehydrate Local-Only Dependencies (not committed to git)
+
+This repo intentionally does **not** commit large artifacts (datasets, outputs, checkpoints, LoRA weights, or the VDA repo clone). They are ignored by `.gitignore` to prevent accidental uploads.
 
 ```bash
-# GenFocus model weights (already present if cloned properly)
+# (A) Clone Video-Depth-Anything locally (required for Phase 3)
+git clone https://github.com/DepthAnything/Video-Depth-Anything.git
+
+# (B) Install Python deps (if you are not using the provided conda/SLURM setup)
+pip install -r requirements.txt
+
+# (C) Download weights locally (required for Phases 2/3/5)
 wget https://huggingface.co/nycu-cplab/Genfocus-Model/resolve/main/bokehNet.safetensors
 wget https://huggingface.co/nycu-cplab/Genfocus-Model/resolve/main/deblurNet.safetensors
 
-# VDA metric depth weights
 mkdir -p checkpoints
 wget -O checkpoints/metric_video_depth_anything_vitl.pth \
   "https://huggingface.co/depth-anything/Metric-Video-Depth-Anything-Large/resolve/main/metric_video_depth_anything_vitl.pth"
 ```
+
+On HPC systems, follow local policy for downloads/installs (often: do installs on a compute node).
 
 ### 3. Run the Full Pipeline
 
