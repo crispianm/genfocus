@@ -1,0 +1,30 @@
+# ===== FocusMamba Data Generation Pipeline =====
+# Core ML
+torch
+torchvision
+transformers>=4.40.0
+diffusers
+peft
+accelerate
+safetensors
+timm
+einops
+easydict
+natsort
+
+# Numeric / image processing
+numpy
+opencv-python-headless
+Pillow
+scipy
+scikit-image
+
+# Utilities
+tqdm
+rich
+matplotlib
+seaborn
+
+# Serialisation
+protobuf
+sentencepiece
