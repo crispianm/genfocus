@@ -63,7 +63,7 @@ def sample_lens_params(
     params = []
     for _ in range(n_sets):
         f = rng.uniform(24e-3, 85e-3)
-        log_N = rng.uniform(np.log(1.4), np.log(8.0))
+        log_N = rng.uniform(np.log(2.8), np.log(8.0))
         N = float(np.exp(log_N))
         u = beta_dist.rvs(2, 2, random_state=int(rng.integers(1e9)))
         S_focus = d_min + u * (d_max - d_min)
@@ -119,8 +119,8 @@ def main() -> None:
         with open(stats_path) as f:
             stats = json.load(f)
 
-        d_min = max(stats["d_min"], 0.1)  # clamp to avoid degenerate CoC
-        d_max = stats["d_max"]
+        d_min = max(stats.get("d_p5", stats["d_min"]), 0.1)  # use 5th-pct, not raw min
+        d_max = stats.get("d_p95", stats["d_max"])            # use 95th-pct, not raw max
         if d_max <= d_min:
             continue
 
@@ -160,7 +160,7 @@ def main() -> None:
         "p95": float(np.percentile(all_coc, 95)),
         "p99": float(np.percentile(all_coc, 99)),
         "max": float(np.max(all_coc)),
-        "recommended_max_coc": float(np.percentile(all_coc, 95)),
+        "recommended_max_coc": float(np.percentile(all_coc, 99)),
     }
 
     # Write stats

@@ -58,12 +58,12 @@ def sample_coc_params(
     seed: int | None = None,
 ) -> list[dict]:
     rng = np.random.default_rng(seed)
-    d_min = max(depth_stats["d_min"], 0.1)
-    d_max = depth_stats["d_max"]
+    d_min = max(depth_stats.get("d_p5", depth_stats["d_min"]), 0.1)  # use 5th-pct, not raw min
+    d_max = depth_stats.get("d_p95", depth_stats["d_max"])            # use 95th-pct, not raw max
     params = []
     for _ in range(N_sets):
         f = rng.uniform(24e-3, 85e-3)                          # focal length, metres
-        log_N = rng.uniform(np.log(1.4), np.log(8.0))
+        log_N = rng.uniform(np.log(2.8), np.log(8.0))
         N = float(np.exp(log_N))                                # f-number, log-uniform
         u = beta_dist.rvs(2, 2, random_state=int(rng.integers(1e9)))
         S_focus = d_min + u * (d_max - d_min)                  # focus distance
