@@ -261,8 +261,15 @@ def main() -> None:
 
     scene_id = scene_ids[args.scene_idx]
     info = scene_index[scene_id]
-    sharp_dir = out_root / scene_id / "frames_sharp"
+    scene_dir = out_root / scene_id
+    sharp_dir = scene_dir / "frames_sharp"
     sentinel = sharp_dir / ".done"
+
+    # Ensure run-local split metadata exists for downstream validation.
+    split_val = str(info.get("split", "")).strip()
+    if split_val in {"train", "val", "test"}:
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        (scene_dir / "split.txt").write_text(split_val)
 
     if sentinel.exists():
         console.print(f"[green]{scene_id}: frames_sharp/.done exists — skipping.[/green]")
