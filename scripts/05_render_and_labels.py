@@ -81,15 +81,25 @@ def compute_focus_map(
     N: float,
     S_focus: float,
     max_coc: float,
+    coc_accept: float = 3e-5,
+    coc_gamma: float = 2.0,
 ) -> np.ndarray:
     """
     depth_map : (H, W) float32, metres
     Returns   : focus_map (H, W) float16 in [0, 1]
     """
     depth_safe = np.maximum(depth_map, 1e-6)
-    coc = (f ** 2 / (N * S_focus)) * np.abs(depth_safe - S_focus) / depth_safe
-    coc_norm = np.clip(coc / max_coc, 0.0, 1.0)
-    focus_map = (1.0 - coc_norm).astype(np.float16)
+    S_focus_safe = max(float(S_focus), float(f) + 1e-6)
+    denom = float(N) * (S_focus_safe - float(f))
+    coc_raw = (float(f) ** 2 / denom) * np.abs(depth_safe - S_focus_safe) / depth_safe
+
+    # Apply an "acceptable CoC" deadzone (small blur = still treated as in-focus)
+    coc_eff = np.maximum(coc_raw - float(coc_accept), 0.0)
+
+    coc_norm = np.clip(coc_eff / float(max_coc), 0.0, 1.0)
+    # Nonlinear falloff: pushes mid-range blur toward "more in focus"
+    defocus = np.power(coc_norm, float(coc_gamma))
+    focus_map = (1.0 - defocus).astype(np.float16)
     return focus_map
 
 
@@ -138,14 +148,15 @@ def run_bokeh_net(
     force_no_tile = min(w, h) < 512
     no_tiled_denoise = disable_tiling or force_no_tile
 
-    # Build defocus condition: BokehNet expects the defocus map (CoC-normalised),
-    # which is (1 - focus_map), as a 3-channel tensor in [0, 1].
+    # Build defocus condition: BokehNet expects the defocus map (CoC-normalised).
+    # IMPORTANT: pass as a PIL image so Diffusers' image_processor preprocessing
+    # (incl. normalization to the VAE's expected range) is applied.
     defocus = (1.0 - focus_map.astype(np.float32))
-    defocus_t = torch.from_numpy(defocus).unsqueeze(0).float()
-    cond_map = defocus_t.repeat(3, 1, 1).unsqueeze(0)  # (1, 3, H, W)
+    defocus_u8 = np.clip(defocus * 255.0, 0.0, 255.0).astype(np.uint8)
+    defocus_img = Image.fromarray(defocus_u8, mode="L").convert("RGB")
 
     cond_img = Condition(frame, "bokeh")
-    cond_dmf = Condition(cond_map, "bokeh", [0, 0], 1.0, No_preprocess=True)
+    cond_dmf = Condition(defocus_img, "bokeh", [0, 0], 1.0)
 
     seed_everything(seed)
     gen = torch.Generator(device=pipe.device).manual_seed(seed)
@@ -154,7 +165,7 @@ def run_bokeh_net(
         pipe,
         height=h,
         width=w,
-        prompt="an excellent photo with a large aperture",
+        prompt="an excellent photo with natural depth of field",
         num_inference_steps=steps,
         conditions=[cond_img, cond_dmf],
         guidance_scale=1.0,
@@ -177,6 +188,10 @@ def main() -> None:
     parser.add_argument("--scene_idx", type=int, required=True, help="SLURM array index")
     parser.add_argument("--max_coc", type=float, required=True,
                         help="Calibrated max_coc from Phase 4")
+    parser.add_argument("--coc_accept", type=float, default=3e-5,
+                        help="Acceptable CoC deadzone in metres (default: 3e-5 ~= 0.03mm)")
+    parser.add_argument("--coc_gamma", type=float, default=2.0,
+                        help="Nonlinear exponent applied to coc_norm (default: 2.0). Higher => wider DoF")
     parser.add_argument("--n_sets", type=int, default=4,
                         help="Number of CoC parameter sets per scene")
     parser.add_argument("--steps", type=int, default=30, help="Diffusion steps for BokehNet")
@@ -184,12 +199,16 @@ def main() -> None:
     parser.add_argument("--model_id", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--lora_path", type=str, default=".")
     parser.add_argument("--lora_weight", type=str, default="bokehNet.safetensors")
+    parser.add_argument("--max_frames", type=int, default=0,
+                        help="If >0, process only the first N frames of the scene (for quick tests)")
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
     max_coc = args.max_coc
 
     assert 1e-6 < max_coc < 1.0, f"max_coc={max_coc} looks wrong (expected 1e-6–1.0)"
+    assert 0.0 <= args.coc_accept < max_coc, f"coc_accept={args.coc_accept} must be in [0, max_coc)"
+    assert 0.5 <= args.coc_gamma <= 8.0, f"coc_gamma={args.coc_gamma} looks unreasonable (expected ~0.5–8)"
 
     with open(args.scene_index) as f:
         scene_index = json.load(f)
@@ -221,6 +240,10 @@ def main() -> None:
     sharp_dir = scene_dir / "frames_sharp"
     frame_paths = natsorted(sharp_dir.glob("frame_*.png"), key=lambda p: p.name)
     depth_paths = natsorted(depth_dir.glob("depth_*.npz"), key=lambda p: p.name)
+
+    if args.max_frames and args.max_frames > 0:
+        frame_paths = frame_paths[: args.max_frames]
+        depth_paths = depth_paths[: args.max_frames]
 
     if len(frame_paths) != len(depth_paths):
         console.print(f"[red]{scene_id}: frame count ({len(frame_paths)}) != depth count ({len(depth_paths)}). Fix manually.[/red]")
@@ -279,7 +302,13 @@ def main() -> None:
             depth = np.load(depth_paths[t])["depth"].astype(np.float32)
 
             # Compute GT focus map
-            focus_map = compute_focus_map(depth, max_coc=max_coc, **params)
+            focus_map = compute_focus_map(
+                depth,
+                max_coc=max_coc,
+                coc_accept=args.coc_accept,
+                coc_gamma=args.coc_gamma,
+                **params,
+            )
 
             # Save focus map
             np.savez_compressed(focus_out, focus_map=focus_map)
@@ -316,7 +345,9 @@ def main() -> None:
 
     # Write authoritative metadata
     metadata = {
-        "sets": [{**p, "max_coc": max_coc} for p in param_sets]
+        "sets": [{**p, "max_coc": max_coc} for p in param_sets],
+        "coc_accept": float(args.coc_accept),
+        "coc_gamma": float(args.coc_gamma),
     }
     with open(scene_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)

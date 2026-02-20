@@ -241,6 +241,8 @@ def main() -> None:
                         help="Stride between temporal windows (default: 8)")
     parser.add_argument("--no_temporal_avg", action="store_true",
                         help="Disable temporal averaging (process each frame independently)")
+    parser.add_argument("--max_frames", type=int, default=0,
+                        help="If >0, process only the first N frames of the scene (for quick tests)")
     parser.add_argument("--model_id", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--lora_path", type=str, default=".")
     parser.add_argument("--lora_weight", type=str, default="deblurNet.safetensors")
@@ -280,7 +282,13 @@ def main() -> None:
     psnr_log = logs_dir / "deblur_psnr.csv"
 
     frame_paths = [raw_root / fp for fp in info["frames"]]
-    console.print(f"[bold]Processing scene: {scene_id} ({len(frame_paths)} frames)[/bold]")
+    if args.max_frames and args.max_frames > 0:
+        frame_paths = frame_paths[: args.max_frames]
+        console.print(
+            f"[bold]Processing scene: {scene_id} ({len(frame_paths)} frames; capped by --max_frames)[/bold]"
+        )
+    else:
+        console.print(f"[bold]Processing scene: {scene_id} ({len(frame_paths)} frames)[/bold]")
 
     # Check which frames still need processing
     needed = []

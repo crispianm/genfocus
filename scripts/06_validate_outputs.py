@@ -41,9 +41,13 @@ def validate_scene(
     scene_dir: Path,
     expected_frames: int,
     n_sets: int,
+    max_frames: int = 0,
 ) -> tuple[bool, list[str]]:
     """Validate all outputs for a single scene. Returns (pass, [reasons])."""
     errors: list[str] = []
+
+    if max_frames and max_frames > 0:
+        expected_frames = min(expected_frames, max_frames)
 
     # --- frames_sharp ---
     sharp_dir = scene_dir / "frames_sharp"
@@ -158,6 +162,8 @@ def main() -> None:
     parser.add_argument("--scene_index", type=str, required=True)
     parser.add_argument("--report", type=str, required=True, help="Output report JSON path")
     parser.add_argument("--n_sets", type=int, default=4, help="Expected number of CoC sets per scene")
+    parser.add_argument("--max_frames", type=int, default=0,
+                        help="If >0, validate only the first N frames per scene (for quick tests)")
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
@@ -177,9 +183,10 @@ def main() -> None:
     for scene_id, info in sorted(scene_index.items()):
         scene_dir = out_root / scene_id
         n_frames = info["num_frames"]
-        total_frames += n_frames
+        expected = min(n_frames, args.max_frames) if args.max_frames and args.max_frames > 0 else n_frames
+        total_frames += expected
 
-        ok, reasons = validate_scene(scene_id, scene_dir, n_frames, args.n_sets)
+        ok, reasons = validate_scene(scene_id, scene_dir, n_frames, args.n_sets, max_frames=args.max_frames)
 
         split = info.get("split", "unknown")
         if split in split_counts:

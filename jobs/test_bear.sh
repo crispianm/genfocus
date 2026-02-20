@@ -9,7 +9,7 @@
 #SBATCH --job-name=test_bear
 #SBATCH --partition=workq
 #SBATCH --gres=gpu:1
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=8
 #SBATCH --output=logs/test_bear_%j.out
@@ -26,7 +26,7 @@ cd /projects/b5dh/Genfocus
 
 # Each run is saved in its own timestamped directory so outputs are never
 # overwritten across repeated executions.
-RUN_ID=$(date +%Y%m%d_%H%M%S)
+RUN_ID=$(date +%Y%m%d)
 export OUT_ROOT=./output/runs/run_${RUN_ID}
 export RAW_ROOT=./data
 # SCENE_INDEX comes from Phase 1 which lives in the shared ./output root.
@@ -86,6 +86,7 @@ echo ""
 echo "=== PHASE 4: CoC Calibration ==="
 python scripts/04_calibrate_coc.py \
     --out_root          "$OUT_ROOT" \
+    --scene_index       "$SCENE_INDEX" \
     --sample_fraction   1.0 \
     --output_stats      "$OUT_ROOT/logs/coc_stats.json" \
     --output_plot       "$OUT_ROOT/logs/coc_histogram.png" \
@@ -113,7 +114,7 @@ python scripts/05_render_and_labels.py \
     --scene_index   "$SCENE_INDEX" \
     --scene_idx     "$BEAR_IDX" \
     --max_coc       "$MAX_COC" \
-    --n_sets        1 \
+    --n_sets        10 \
     --steps         30 \
     --model_id      black-forest-labs/FLUX.1-dev \
     --lora_path     . \
@@ -130,7 +131,7 @@ python scripts/06_validate_outputs.py \
     --out_root      "$OUT_ROOT" \
     --scene_index   "$SCENE_INDEX" \
     --report        "$OUT_ROOT/logs/validation_report.json" \
-    --n_sets        2
+    --n_sets        10
 
 echo "Phase 6 done at $(date)"
 
