@@ -57,9 +57,11 @@ output/{scene_id}/
     set_00/bokeh_0000.png, ...
   focus_maps/                  # Physically grounded focus labels (NPZ)
     # keys per file:
-    # - focus_map          : absolute CoC on sensor (float32, metres)
-    # - guidance_map       : Bokeh guidance map (float16, [0,1])
+    # - focus_map          : primary training label (linear guidance, float16, [0,1])
+    # - guidance_map       : Bokeh guidance map used for render (float16, [0,1])
+    # - focus_map_coc_metres : absolute CoC on sensor (float32, metres, reference)
     # - signed_diopter_map : signed (1/depth - 1/S_focus) (float32, 1/metres)
+    # - roi_bbox           : [x_min, y_min, x_max, y_max] in-focus region (int32)
     set_00/focus_0000.npz, ...
 ```
 
