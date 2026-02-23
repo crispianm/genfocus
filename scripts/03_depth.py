@@ -69,11 +69,14 @@ def load_vda_model(vda_repo: str, checkpoint: str, device: str):
 # Frame loading
 # ---------------------------------------------------------------------------
 
-def load_frames_as_array(frame_dir: Path) -> np.ndarray:
-    """Load all frame_XXXX.png from a directory into (N, H, W, 3) uint8 array."""
+def load_frames_as_array(frame_dir: Path, max_frames: int = 0) -> np.ndarray:
+    """Load frame_XXXX.png from a directory into (N, H, W, 3) uint8 array."""
     paths = natsorted(frame_dir.glob("frame_*.png"), key=lambda p: p.name)
     if not paths:
         raise FileNotFoundError(f"No frame_*.png in {frame_dir}")
+
+    if max_frames and max_frames > 0:
+        paths = paths[:max_frames]
 
     frames = []
     for p in paths:
@@ -218,6 +221,8 @@ def main() -> None:
                         help="Frame overlap between chunks")
     parser.add_argument("--fp32", action="store_true",
                         help="Use FP32 inference (default: FP16)")
+    parser.add_argument("--max_frames", type=int, default=0,
+                        help="If >0, process only the first N frames of the scene (for quick tests)")
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
@@ -253,7 +258,7 @@ def main() -> None:
 
     # Load sharpened frames
     console.print(f"[bold]Loading frames from {sharp_dir}[/bold]")
-    frames = load_frames_as_array(sharp_dir)
+    frames = load_frames_as_array(sharp_dir, max_frames=args.max_frames)
     console.print(f"  Loaded {frames.shape[0]} frames at {frames.shape[1]}x{frames.shape[2]}")
 
     # Infer depth

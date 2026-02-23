@@ -7,6 +7,7 @@ value. No GPU required.
 Usage:
     python scripts/04_calibrate_coc.py \
         --out_root        ./output \
+        --scene_index     ./output/scene_index.json \
         --sample_fraction 0.2 \
         --output_plot     ./output/logs/coc_histogram.png \
         --output_stats    ./output/logs/coc_stats.json
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -43,8 +45,23 @@ def compute_raw_coc(
     N       : f-number (e.g. 2.8)
     S_focus : focus distance in metres
     """
+    # Thin-lens defocus blur diameter on the image plane (sensor), in metres.
+    # Uses (S_focus - f) rather than S_focus to avoid noticeable error at
+    # close focus distances.
     depth_safe = np.maximum(depth.astype(np.float32), 1e-6)
-    return (f ** 2 / (N * S_focus)) * np.abs(depth_safe - S_focus) / depth_safe
+    S_focus_safe = max(float(S_focus), float(f) + 1e-6)
+    denom = float(N) * (S_focus_safe - float(f))
+    return (float(f) ** 2 / denom) * np.abs(depth_safe - S_focus_safe) / depth_safe
+
+
+def apply_coc_acceptance(coc_raw: np.ndarray, coc_accept: float) -> np.ndarray:
+    """Apply an "acceptable" CoC deadzone.
+
+    In real optics, very small blur circles are visually indistinguishable from
+    perfect focus. Subtracting a small acceptance threshold makes the resulting
+    focus maps less unrealistically shallow.
+    """
+    return np.maximum(coc_raw - float(coc_accept), 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +95,8 @@ def sample_lens_params(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 4: Calibrate CoC distribution")
     parser.add_argument("--out_root", type=str, required=True)
+    parser.add_argument("--scene_index", type=str, default="",
+                        help="Path to scene_index.json (optional; auto-detected if omitted)")
     parser.add_argument("--sample_fraction", type=float, default=0.2,
                         help="Fraction of scenes to sample (default: 0.2)")
     parser.add_argument("--output_stats", type=str, required=True,
@@ -86,15 +105,45 @@ def main() -> None:
                         help="Optional histogram plot path (.png)")
     parser.add_argument("--n_lens_sets", type=int, default=8,
                         help="Number of lens param sets per scene")
+    parser.add_argument("--coc_accept", type=float, default=3e-5,
+                        help="Acceptable CoC deadzone in metres (default: 3e-5 ~= 0.03mm)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
-    scene_index_path = out_root / "scene_index.json"
+    candidate_paths: list[Path] = []
 
-    if not scene_index_path.exists():
-        console.print("[red]scene_index.json not found. Run Phase 1 first.[/red]")
+    if args.scene_index:
+        candidate_paths.append(Path(args.scene_index))
+
+    env_scene_index = os.environ.get("SCENE_INDEX", "").strip()
+    if env_scene_index:
+        candidate_paths.append(Path(env_scene_index))
+
+    candidate_paths.append(out_root / "scene_index.json")
+
+    # Support run-based output layouts, e.g. out_root=output/runs/run_... while
+    # scene_index.json remains in output/.
+    for parent in out_root.parents:
+        candidate_paths.append(parent / "scene_index.json")
+
+    seen: set[Path] = set()
+    deduped_candidates: list[Path] = []
+    for p in candidate_paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        deduped_candidates.append(p)
+
+    scene_index_path = next((p for p in deduped_candidates if p.exists()), None)
+
+    if scene_index_path is None:
+        searched = "\n".join(f"  - {p}" for p in deduped_candidates)
+        console.print("[red]scene_index.json not found. Run Phase 1 first or pass --scene_index.[/red]")
+        console.print(f"[yellow]Searched paths:[/yellow]\n{searched}")
         sys.exit(1)
+
+    console.print(f"Using scene index: {scene_index_path}")
 
     with open(scene_index_path) as f:
         scene_index = json.load(f)
@@ -139,7 +188,8 @@ def main() -> None:
         for fi in frame_indices:
             depth = np.load(depth_files[fi])["depth"].astype(np.float32)
             for lp in lens_params:
-                coc = compute_raw_coc(depth, **lp)
+                coc_raw = compute_raw_coc(depth, **lp)
+                coc = apply_coc_acceptance(coc_raw, args.coc_accept)
                 # Subsample pixels for memory efficiency
                 flat = coc.ravel()
                 if len(flat) > 50000:
@@ -161,6 +211,7 @@ def main() -> None:
         "p99": float(np.percentile(all_coc, 99)),
         "max": float(np.max(all_coc)),
         "recommended_max_coc": float(np.percentile(all_coc, 95)),
+        "coc_accept": float(args.coc_accept),
     }
 
     # Write stats
@@ -188,7 +239,7 @@ def main() -> None:
                 ax.axvline(pval, color="red", linestyle="--", alpha=0.8)
                 ax.text(pval, ax.get_ylim()[1] * 0.9, f" {label}={pval:.4f}",
                         fontsize=8, color="red")
-            ax.set_xlabel("Raw CoC (metres)")
+            ax.set_xlabel("Effective CoC (metres) (raw - coc_accept, clipped)")
             ax.set_ylabel("Density")
             ax.set_title("CoC Distribution (sampled scenes × lens params)")
             fig.tight_layout()
