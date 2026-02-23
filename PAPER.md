@@ -131,9 +131,9 @@ we calibrate it empirically from the actual depth data:
    - Focal length $f \sim \mathcal{U}(24\text{mm}, 85\text{mm})$
    - F-number $N \sim \text{LogUniform}(1.4, 8.0)$
    - Focus distance $S_{\text{focus}} \sim d_{\min} + \text{Beta}(2, 2) \cdot (d_{\max} - d_{\min})$
-3. Compute raw CoC over sampled depth pixels using the thin-lens formula:
+3. Compute raw CoC over sampled depth pixels using the full thin-lens formula:
 
-$$\text{CoC} = \frac{f^2}{N \cdot S_{\text{focus}}} \cdot \frac{|d - S_{\text{focus}}|}{d}$$
+$$\text{CoC} = \frac{f^2}{N \cdot (S_{\text{focus}} - f)} \cdot \frac{|d - S_{\text{focus}}|}{d}$$
 
 4. The **95th percentile** of the collected CoC distribution becomes `max_coc`
 
@@ -158,8 +158,8 @@ between these causes the model to learn incorrect focus-to-defocus mappings.
 2. Load metric depth
 3. Compute GT focus map using the calibrated `max_coc`
 4. Save focus map immediately
-5. Pass the **exact same focus map** (converted to defocus guidance via
-   `1 - focus_map`) to BokehNet
+5. Pass the **exact same guidance signal** (converted to defocus guidance via
+  `1 - guidance_map`) to BokehNet
 6. Save the BokehNet render
 
 The focus map and bokeh render are always physically consistent — they
@@ -272,11 +272,13 @@ The core data generation phase. For each scene:
 - Draws N CoC parameter sets (default: 4, using 2 for test runs)
 - Seeds on `hash(scene_id)` for reproducibility across re-runs
 - For each parameter set × frame, atomically (§3.4):
-  - Computes absolute CoC map and guidance from depth + CoC params
+  - Computes CoC-derived guidance and auxiliary physical maps from depth + CoC params
   - Saves NPZ (`focus_XXXX.npz`) with:
-    - `focus_map`: absolute CoC diameter on sensor (float32, metres)
-    - `guidance_map`: Bokeh guidance (float16, [0,1])
+    - `focus_map`: linear guidance training target (float16, [0,1])
+    - `guidance_map`: Bokeh guidance used for rendering (float16, [0,1])
+    - `focus_map_coc_metres`: absolute CoC diameter on sensor (float32, metres, reference)
     - `signed_diopter_map`: signed optical-power error (float32, 1/metres)
+    - `roi_bbox`: in-focus region `[x_min, y_min, x_max, y_max]` (int32)
   - Renders bokeh using `guidance_map` (same camera physics)
   - Saves as PNG (`bokeh_XXXX.png`)
 - Uses shared initial latents across frames for temporal consistency
@@ -285,8 +287,8 @@ The core data generation phase. For each scene:
 
 **BokehNet conditioning**: `guidance_map` is converted to defocus
 (`1 - guidance_map`), expanded to 3 channels, and passed as a guidance
-condition to FLUX alongside the sharp frame. The prompt "an excellent
-photo with a large aperture" guides the diffusion at 30 steps.
+condition to FLUX alongside the sharp frame. The render path uses linear
+CoC normalization (no gamma warp) to preserve physical correspondence.
 
 ### Phase 6: Output Validation
 
@@ -295,7 +297,7 @@ CPU-only sweep that checks every scene for completeness:
 - Frame counts match across all modalities
 - All NPZ files loadable with correct keys
 - Depth values are positive
-- `focus_map` values are non-negative (absolute CoC)
+- `focus_map` / `guidance_map` values are in [0, 1]
 - `guidance_map` values are in [0, 1] when present
 - Spatial dimensions are consistent
 - `metadata.json` contains required keys
@@ -327,20 +329,19 @@ output/{scene_id}/
     .done                               # sentinel
   focus_maps/
     set_00/ ... set_03/
-      focus_0000.npz ... focus_NNNN.npz # keys: focus_map, guidance_map, signed_diopter_map
+      focus_0000.npz ... focus_NNNN.npz # keys: focus_map, guidance_map, focus_map_coc_metres, signed_diopter_map, roi_bbox
 ```
 
 **Dataloader loading convention**:
 ```python
 depth = np.load(path)['depth'].astype(np.float32)              # metres
-focus_abs = np.load(path)['focus_map'].astype(np.float32)      # absolute CoC, metres
-guidance = np.load(path)['guidance_map'].astype(np.float32)    # [0,1] (if present)
-diopter = np.load(path)['signed_diopter_map'].astype(np.float32)  # 1/metres (if present)
+focus_map = np.load(path)['focus_map'].astype(np.float32)      # linear guidance target [0,1]
+guidance = np.load(path)['guidance_map'].astype(np.float32)    # [0,1]
+coc_abs = np.load(path)['focus_map_coc_metres'].astype(np.float32)  # absolute CoC, metres
+diopter = np.load(path)['signed_diopter_map'].astype(np.float32)  # 1/metres
+roi_bbox = np.load(path)['roi_bbox'].astype(np.int32)          # [x_min, y_min, x_max, y_max]
 frame = cv2.imread(str(path))                                  # uint8 BGR
 ```
-
-The `roi` field is a training-time construct (random crop or saliency region)
-and is intentionally absent from this generation pipeline.
 
 ---
 
@@ -348,7 +349,7 @@ and is intentionally absent from this generation pipeline.
 
 The CoC formula used throughout the pipeline (must match the dataloader):
 
-$$\text{CoC}(d) = \frac{f^2}{N \cdot S_{\text{focus}}} \cdot \frac{|d - S_{\text{focus}}|}{d}$$
+$$\text{CoC}(d) = \frac{f^2}{N \cdot (S_{\text{focus}} - f)} \cdot \frac{|d - S_{\text{focus}}|}{d}$$
 
 Where:
 - $f$ = focal length (metres)
@@ -358,18 +359,18 @@ Where:
 
 Derived maps:
 
-$$\text{focus\_map}_{\text{abs}} = \text{CoC}(d)$$
+$$\text{focus\_map} = 1 - \text{CoC}_{\text{norm}}$$
 
 $$\text{CoC}_{\text{norm}} = \text{clamp}\left(\frac{\max(\text{CoC}(d)-\text{CoC}_{\text{accept}},\ 0)}{\text{max\_coc}},\ 0,\ 1\right)$$
 
-$$\text{guidance\_map} = 1 - \left(\text{CoC}_{\text{norm}}\right)^{\gamma}$$
+$$\text{guidance\_map} = 1 - \text{CoC}_{\text{norm}}$$
 
 $$\Delta D = \frac{1}{d} - \frac{1}{S_{\text{focus}}}$$
 
-Where `focus_map_abs` is physically comparable across scenes, `guidance_map`
-is the bounded control signal consumed by BokehNet, and $\Delta D$ is signed
-diopter error relative to focus plane. The `max_coc` normalisation constant is
-calibrated empirically in Phase 4.
+Where `focus_map`/`guidance_map` are bounded control targets aligned with the
+render path, `focus_map_coc_metres` is the physically interpretable absolute
+reference map, and $\Delta D$ is signed diopter error relative to focus plane.
+The `max_coc` normalisation constant is calibrated empirically in Phase 4.
 
 ### Parameter Sampling
 

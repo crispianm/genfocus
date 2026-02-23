@@ -2,12 +2,13 @@
 """Phase 5: GT Focus Map Generation & BokehNet Rendering (Merged).
 
 For each scene, samples CoC parameters and computes physically grounded maps:
-- focus_map: absolute Circle-of-Confusion (CoC) diameter on sensor (metres)
-- guidance_map: bounded [0,1] map used as BokehNet guidance
+- focus_map: primary training label used for rendering guidance (float16, [0,1])
+- focus_map_coc_metres: absolute Circle-of-Confusion (CoC) diameter on sensor (metres)
 - signed_diopter_map: signed optical power error (1/metres)
+- roi_bbox: in-focus ROI bbox [x_min, y_min, x_max, y_max]
 
-BokehNet rendering uses guidance_map, while saved focus labels remain
-interpretable and comparable across scenes.
+BokehNet rendering always uses linear guidance (no gamma warp) to preserve
+physical correspondence between depth-derived CoC and rendered blur.
 
 Designed to run as a SLURM array job — each task processes one scene.
 
@@ -57,20 +58,39 @@ console = Console()
 
 def sample_coc_params(
     depth_stats: dict,
+    max_coc: float,
     N_sets: int = 4,
     seed: int | None = None,
 ) -> list[dict]:
     rng = np.random.default_rng(seed)
     d_min = max(depth_stats["d_min"], 0.1)
     d_max = depth_stats["d_max"]
+    d_median = depth_stats.get("d_median", (d_min + d_max) / 2.0)
     params = []
-    for _ in range(N_sets):
+    max_attempts = max(20, N_sets * 20)
+    attempts = 0
+
+    while len(params) < N_sets and attempts < max_attempts:
+        attempts += 1
         f = rng.uniform(24e-3, 85e-3)                          # focal length, metres
         log_N = rng.uniform(np.log(1.4), np.log(8.0))
         N = float(np.exp(log_N))                                # f-number, log-uniform
         u = beta_dist.rvs(2, 2, random_state=int(rng.integers(1e9)))
         S_focus = d_min + u * (d_max - d_min)                  # focus distance
+        S_focus_safe = max(float(S_focus), float(f) + 1e-6)
+
+        # Reject parameter draws that are very likely to saturate most pixels.
+        denom = N * (S_focus_safe - float(f))
+        coc_at_median = (float(f) ** 2 / denom) * abs(float(d_median) - S_focus_safe) / max(float(d_median), 1e-6)
+        if coc_at_median > float(max_coc) * 10.0:
+            continue
+
         params.append({"f": float(f), "N": N, "S_focus": float(S_focus)})
+
+    if len(params) < N_sets:
+        for _ in range(N_sets - len(params)):
+            params.append({"f": 0.050, "N": 4.0, "S_focus": float(max(d_median, 0.2))})
+
     return params
 
 
@@ -85,17 +105,20 @@ def compute_optical_maps(
     S_focus: float,
     max_coc: float,
     coc_accept: float = 3e-5,
-    coc_gamma: float = 2.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    coc_gamma: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """
     depth_map : (H, W) float32, metres
     Returns   :
-      focus_map_abs_coc_m : (H, W) float32, absolute CoC diameter on sensor (metres)
-      guidance_map        : (H, W) float16 in [0, 1], used by BokehNet
+            focus_map_training   : (H, W) float16 in [0, 1], primary training label
+            guidance_map        : (H, W) float16 in [0, 1], used by BokehNet (linear)
       signed_diopter_map  : (H, W) float32, (1/depth - 1/S_focus) in 1/metres
+            focus_map_coc_m     : (H, W) float32, absolute CoC diameter on sensor (metres)
+            focus_map_perceptual: optional (H, W) float16 in [0,1], gamma-warped variant
     """
     depth_safe = np.maximum(depth_map, 1e-6)
     S_focus_safe = max(float(S_focus), float(f) + 1e-6)
+        # Full thin-lens CoC formula. Note: denominator is (S_focus - f), not S_focus.
     denom = float(N) * (S_focus_safe - float(f))
     coc_raw = (float(f) ** 2 / denom) * np.abs(depth_safe - S_focus_safe) / depth_safe
 
@@ -103,14 +126,33 @@ def compute_optical_maps(
     coc_eff = np.maximum(coc_raw - float(coc_accept), 0.0)
 
     coc_norm = np.clip(coc_eff / float(max_coc), 0.0, 1.0)
-    # Nonlinear falloff: pushes mid-range blur toward "more in focus"
-    defocus = np.power(coc_norm, float(coc_gamma))
-    guidance_map = (1.0 - defocus).astype(np.float16)
+    # Linear guidance for rendering to preserve physical blur correspondence.
+    guidance_map = (1.0 - coc_norm).astype(np.float16)
+
+    focus_map_perceptual = None
+    if abs(float(coc_gamma) - 1.0) > 1e-6:
+        defocus_perceptual = np.power(coc_norm, float(coc_gamma))
+        focus_map_perceptual = (1.0 - defocus_perceptual).astype(np.float16)
 
     signed_diopter_map = (1.0 / depth_safe - 1.0 / S_focus_safe).astype(np.float32)
-    focus_map_abs_coc_m = coc_raw.astype(np.float32)
+    focus_map_coc_m = coc_raw.astype(np.float32)
+    focus_map_training = guidance_map
 
-    return focus_map_abs_coc_m, guidance_map, signed_diopter_map
+    return focus_map_training, guidance_map, signed_diopter_map, focus_map_coc_m, focus_map_perceptual
+
+
+def compute_roi_bbox(guidance_map: np.ndarray, threshold: float = 0.9) -> list[int]:
+    """Return in-focus ROI bbox [x_min, y_min, x_max, y_max] in pixel coordinates."""
+    in_focus = guidance_map.astype(np.float32) >= float(threshold)
+    h, w = guidance_map.shape
+    if not in_focus.any():
+        return [0, 0, w - 1, h - 1]
+
+    rows = np.any(in_focus, axis=1)
+    cols = np.any(in_focus, axis=0)
+    y_min, y_max = np.where(rows)[0][[0, -1]]
+    x_min, x_max = np.where(cols)[0][[0, -1]]
+    return [int(x_min), int(y_min), int(x_max), int(y_max)]
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +203,16 @@ def run_bokeh_net(
     # Build defocus condition: BokehNet expects the defocus map (CoC-normalised).
     # IMPORTANT: pass as a PIL image so Diffusers' image_processor preprocessing
     # (incl. normalization to the VAE's expected range) is applied.
+    # 1. Calculate raw defocus [0.0, 1.0]
     defocus = (1.0 - guidance_map.astype(np.float32))
-    defocus_u8 = np.clip(defocus * 255.0, 0.0, 255.0).astype(np.uint8)
-    defocus_img = Image.fromarray(defocus_u8, mode="L").convert("RGB")
+    
+    # 2. Convert to Tensor with shape (1, 3, H, W)
+    defocus_t = torch.from_numpy(defocus).unsqueeze(0).float()
+    cond_map = defocus_t.repeat(3, 1, 1).unsqueeze(0) 
 
+    # 3. Pass as Tensor with No_preprocess=True
     cond_img = Condition(frame, "bokeh")
-    cond_dmf = Condition(defocus_img, "bokeh", [0, 0], 1.0)
+    cond_dmf = Condition(cond_map, "bokeh", [0, 0], 1.0, No_preprocess=True)
 
     seed_everything(seed)
     gen = torch.Generator(device=pipe.device).manual_seed(seed)
@@ -200,8 +246,8 @@ def main() -> None:
                         help="Calibrated max_coc from Phase 4")
     parser.add_argument("--coc_accept", type=float, default=3e-5,
                         help="Acceptable CoC deadzone in metres (default: 3e-5 ~= 0.03mm)")
-    parser.add_argument("--coc_gamma", type=float, default=2.0,
-                        help="Nonlinear exponent applied to coc_norm (default: 2.0). Higher => wider DoF")
+    parser.add_argument("--coc_gamma", type=float, default=1.0,
+                        help="Optional gamma for saved perceptual label only (render path remains linear)")
     parser.add_argument("--n_sets", type=int, default=4,
                         help="Number of CoC parameter sets per scene")
     parser.add_argument("--steps", type=int, default=30, help="Diffusion steps for BokehNet")
@@ -269,7 +315,7 @@ def main() -> None:
 
     # Sample CoC params (seeded on scene_id for reproducibility)
     param_seed = hash(scene_id) % (2 ** 32)
-    param_sets = sample_coc_params(depth_stats, N_sets=args.n_sets, seed=param_seed)
+    param_sets = sample_coc_params(depth_stats, max_coc=max_coc, N_sets=args.n_sets, seed=param_seed)
 
     # Prepare shared latents (for temporal consistency within each set)
     sample_frame = Image.open(frame_paths[0])
@@ -312,7 +358,7 @@ def main() -> None:
             depth = np.load(depth_paths[t])["depth"].astype(np.float32)
 
             # Compute physically grounded maps.
-            focus_map_abs_coc_m, guidance_map, signed_diopter_map = compute_optical_maps(
+            focus_map_training, guidance_map, signed_diopter_map, focus_map_coc_m, focus_map_perceptual = compute_optical_maps(
                 depth,
                 max_coc=max_coc,
                 coc_accept=args.coc_accept,
@@ -320,13 +366,19 @@ def main() -> None:
                 **params,
             )
 
+            roi_bbox = compute_roi_bbox(guidance_map.astype(np.float32), threshold=0.9)
+
             # Save absolute + guidance maps.
-            np.savez_compressed(
-                focus_out,
-                focus_map=focus_map_abs_coc_m,
-                guidance_map=guidance_map,
-                signed_diopter_map=signed_diopter_map,
-            )
+            focus_payload = {
+                "focus_map": focus_map_training,
+                "guidance_map": guidance_map,
+                "focus_map_coc_metres": focus_map_coc_m,
+                "signed_diopter_map": signed_diopter_map,
+                "roi_bbox": np.array(roi_bbox, dtype=np.int32),
+            }
+            if focus_map_perceptual is not None:
+                focus_payload["focus_map_perceptual"] = focus_map_perceptual
+            np.savez_compressed(focus_out, **focus_payload)
 
             # Sanity check on guidance map distribution.
             gm_mean = float(guidance_map.astype(np.float32).mean())
@@ -364,9 +416,11 @@ def main() -> None:
         "coc_accept": float(args.coc_accept),
         "coc_gamma": float(args.coc_gamma),
         "focus_map_schema": {
-            "focus_map": "absolute_coc_m",
-            "guidance_map": "unit_interval_for_bokeh",
+            "focus_map": "unit_interval_linear_guidance_training_target",
+            "guidance_map": "unit_interval_linear_for_bokeh",
+            "focus_map_coc_metres": "absolute_coc_m_reference_only",
             "signed_diopter_map": "inverse_meters_relative_to_focus_plane",
+            "roi_bbox": "[x_min,y_min,x_max,y_max] in-focus region in pixels",
         },
     }
     with open(scene_dir / "metadata.json", "w") as f:
