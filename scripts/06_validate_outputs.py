@@ -131,9 +131,32 @@ def validate_scene(
         focus_files = natsorted(first_focus_dir.glob("focus_*.npz"), key=lambda p: p.name) if first_focus_dir.exists() else []
         if focus_files:
             try:
-                fm = np.load(focus_files[0])["focus_map"].astype(np.float32)
-                if fm.min() < -0.01 or fm.max() > 1.01:
-                    errors.append(f"focus_map out of [0,1]: min={fm.min():.3f} max={fm.max():.3f}")
+                focus_npz = np.load(focus_files[0])
+                if "focus_map" not in focus_npz.files:
+                    errors.append("focus_map key missing in focus npz")
+                else:
+                    fm = focus_npz["focus_map"].astype(np.float32)
+                    if not np.isfinite(fm).all():
+                        errors.append("focus_map contains non-finite values")
+                    elif float(fm.min()) < -1e-9:
+                        errors.append(f"focus_map has negative values: min={fm.min():.6g}")
+
+                # New schema: guidance_map in [0,1], signed_diopter_map optional.
+                if "guidance_map" in focus_npz.files:
+                    gm = focus_npz["guidance_map"].astype(np.float32)
+                    if gm.min() < -0.01 or gm.max() > 1.01:
+                        errors.append(f"guidance_map out of [0,1]: min={gm.min():.3f} max={gm.max():.3f}")
+                else:
+                    # Backward compatibility: old datasets used focus_map in [0,1].
+                    if "focus_map" in focus_npz.files:
+                        fm = focus_npz["focus_map"].astype(np.float32)
+                        if fm.min() < -0.01 or fm.max() > 1.01:
+                            errors.append("guidance_map missing and focus_map not in [0,1]")
+
+                if "signed_diopter_map" in focus_npz.files:
+                    dm = focus_npz["signed_diopter_map"].astype(np.float32)
+                    if not np.isfinite(dm).all():
+                        errors.append("signed_diopter_map contains non-finite values")
             except Exception as e:
                 errors.append(f"focus_map not loadable: {e}")
 

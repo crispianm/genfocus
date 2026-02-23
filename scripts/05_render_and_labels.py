@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Phase 5: GT Focus Map Generation & BokehNet Rendering (Merged).
 
-For each scene, samples CoC parameters, computes the GT focus map using
-the calibrated max_coc, saves it, and immediately passes the SAME focus
-map as the guidance signal to BokehNet. Inputs and labels are always
-physically consistent.
+For each scene, samples CoC parameters and computes physically grounded maps:
+- focus_map: absolute Circle-of-Confusion (CoC) diameter on sensor (metres)
+- guidance_map: bounded [0,1] map used as BokehNet guidance
+- signed_diopter_map: signed optical power error (1/metres)
+
+BokehNet rendering uses guidance_map, while saved focus labels remain
+interpretable and comparable across scenes.
 
 Designed to run as a SLURM array job — each task processes one scene.
 
@@ -75,7 +78,7 @@ def sample_coc_params(
 # GT focus map computation (identical to dataloader — no approximations)
 # ---------------------------------------------------------------------------
 
-def compute_focus_map(
+def compute_optical_maps(
     depth_map: np.ndarray,
     f: float,
     N: float,
@@ -83,10 +86,13 @@ def compute_focus_map(
     max_coc: float,
     coc_accept: float = 3e-5,
     coc_gamma: float = 2.0,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     depth_map : (H, W) float32, metres
-    Returns   : focus_map (H, W) float16 in [0, 1]
+    Returns   :
+      focus_map_abs_coc_m : (H, W) float32, absolute CoC diameter on sensor (metres)
+      guidance_map        : (H, W) float16 in [0, 1], used by BokehNet
+      signed_diopter_map  : (H, W) float32, (1/depth - 1/S_focus) in 1/metres
     """
     depth_safe = np.maximum(depth_map, 1e-6)
     S_focus_safe = max(float(S_focus), float(f) + 1e-6)
@@ -99,8 +105,12 @@ def compute_focus_map(
     coc_norm = np.clip(coc_eff / float(max_coc), 0.0, 1.0)
     # Nonlinear falloff: pushes mid-range blur toward "more in focus"
     defocus = np.power(coc_norm, float(coc_gamma))
-    focus_map = (1.0 - defocus).astype(np.float16)
-    return focus_map
+    guidance_map = (1.0 - defocus).astype(np.float16)
+
+    signed_diopter_map = (1.0 / depth_safe - 1.0 / S_focus_safe).astype(np.float32)
+    focus_map_abs_coc_m = coc_raw.astype(np.float32)
+
+    return focus_map_abs_coc_m, guidance_map, signed_diopter_map
 
 
 # ---------------------------------------------------------------------------
@@ -133,16 +143,16 @@ def load_flux_bokeh(
 def run_bokeh_net(
     pipe: FluxPipeline,
     frame: Image.Image,
-    focus_map: np.ndarray,
+    guidance_map: np.ndarray,
     steps: int,
     latents: torch.Tensor | None = None,
     seed: int = 42,
     disable_tiling: bool = False,
 ) -> Image.Image:
-    """Run BokehNet on a single frame with the given focus_map guidance.
+    """Run BokehNet on a single frame with the given guidance_map.
 
-    focus_map: (H, W) float32 in [0, 1]. This is `1 - normalised_coc`.
-    BokehNet expects defocus guidance = coc_norm = 1 - focus_map.
+    guidance_map: (H, W) float32 in [0, 1].
+    BokehNet expects defocus guidance = 1 - guidance_map.
     """
     w, h = frame.size
     force_no_tile = min(w, h) < 512
@@ -151,7 +161,7 @@ def run_bokeh_net(
     # Build defocus condition: BokehNet expects the defocus map (CoC-normalised).
     # IMPORTANT: pass as a PIL image so Diffusers' image_processor preprocessing
     # (incl. normalization to the VAE's expected range) is applied.
-    defocus = (1.0 - focus_map.astype(np.float32))
+    defocus = (1.0 - guidance_map.astype(np.float32))
     defocus_u8 = np.clip(defocus * 255.0, 0.0, 255.0).astype(np.uint8)
     defocus_img = Image.fromarray(defocus_u8, mode="L").convert("RGB")
 
@@ -301,8 +311,8 @@ def main() -> None:
             # Load depth
             depth = np.load(depth_paths[t])["depth"].astype(np.float32)
 
-            # Compute GT focus map
-            focus_map = compute_focus_map(
+            # Compute physically grounded maps.
+            focus_map_abs_coc_m, guidance_map, signed_diopter_map = compute_optical_maps(
                 depth,
                 max_coc=max_coc,
                 coc_accept=args.coc_accept,
@@ -310,13 +320,18 @@ def main() -> None:
                 **params,
             )
 
-            # Save focus map
-            np.savez_compressed(focus_out, focus_map=focus_map)
+            # Save absolute + guidance maps.
+            np.savez_compressed(
+                focus_out,
+                focus_map=focus_map_abs_coc_m,
+                guidance_map=guidance_map,
+                signed_diopter_map=signed_diopter_map,
+            )
 
-            # Sanity check
-            fm_mean = float(focus_map.astype(np.float32).mean())
-            if fm_mean < 0.2 or fm_mean > 0.8:
-                msg = f"{scene_id} set_{set_idx:02d} frame_{t:04d}: focus_map.mean()={fm_mean:.3f}\n"
+            # Sanity check on guidance map distribution.
+            gm_mean = float(guidance_map.astype(np.float32).mean())
+            if gm_mean < 0.2 or gm_mean > 0.8:
+                msg = f"{scene_id} set_{set_idx:02d} frame_{t:04d}: guidance_map.mean()={gm_mean:.3f}\n"
                 with open(warnings_file, "a") as wf:
                     wf.write(msg)
 
@@ -328,7 +343,7 @@ def main() -> None:
                 with torch.no_grad():
                     bokeh_frame = run_bokeh_net(
                         pipe, frame,
-                        focus_map.astype(np.float32),
+                        guidance_map.astype(np.float32),
                         steps=args.steps,
                         latents=latents,
                         seed=42,
@@ -348,6 +363,11 @@ def main() -> None:
         "sets": [{**p, "max_coc": max_coc} for p in param_sets],
         "coc_accept": float(args.coc_accept),
         "coc_gamma": float(args.coc_gamma),
+        "focus_map_schema": {
+            "focus_map": "absolute_coc_m",
+            "guidance_map": "unit_interval_for_bokeh",
+            "signed_diopter_map": "inverse_meters_relative_to_focus_plane",
+        },
     }
     with open(scene_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)

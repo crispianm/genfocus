@@ -1,8 +1,8 @@
 # FocusMamba: Data Generation Pipeline — Technical Report
 
-> **Status**: Pipeline implemented and under testing on Isambard-AI GH200 cluster.  
-> **Last updated**: 2026-02-19  
-> **Bear sequence end-to-end test**: SLURM job 2376646 (running)
+> **Status**: Pipeline implemented and under active validation on Isambard-AI GH200 cluster.  
+> **Last updated**: 2026-02-20  
+> **Latest milestone**: 10-scene multi-test completed through Phase 6 after metadata/schema fixes
 
 ---
 
@@ -12,7 +12,7 @@ Training a video focus estimation model (FocusMamba) requires large-scale,
 physically consistent pairs of:
 
 1. **Bokeh-rendered frames** — synthetic shallow depth-of-field applied to sharp video
-2. **Ground-truth focus maps** — per-pixel continuous focus values in [0, 1], derived from metric depth and the thin-lens Circle of Confusion (CoC) formula
+2. **Ground-truth focus maps** — per-pixel physically interpretable labels derived from metric depth and the thin-lens Circle of Confusion (CoC) formula, including absolute CoC in sensor units
 
 No existing dataset provides both modalities at scale with temporal
 consistency across video sequences. We therefore build an automated HPC
@@ -185,6 +185,21 @@ of each scene. Re-running any phase:
 This is critical for HPC reliability — multi-hour jobs across hundreds
 of GPU nodes will inevitably encounter occasional failures.
 
+### 3.7 Run-Scoped Output Robustness Updates (2026-02-20)
+
+Recent test-driven updates addressed issues that appeared when writing outputs
+to run-scoped directories (e.g. `output/runs/run_<timestamp>`):
+
+- **Phase 4 scene-index discovery fix**: `04_calibrate_coc.py` now supports
+  explicit `--scene_index`, respects `SCENE_INDEX`, and can discover
+  `scene_index.json` via parent-path fallback when `out_root` is run-scoped.
+- **Run-local split metadata seeding**: `02_deblur.py` now writes
+  `output/<run>/<scene_id>/split.txt` from `scene_index` so Phase 6 can
+  validate run directories independently.
+- **Focus schema migration utility**: a one-off script,
+  `scripts/migrate_multi_test_focus_schema.py`, converts legacy focus NPZ
+  files to the new absolute schema without rerendering bokeh outputs.
+
 ---
 
 ## 4. Phase Details
@@ -257,16 +272,19 @@ The core data generation phase. For each scene:
 - Draws N CoC parameter sets (default: 4, using 2 for test runs)
 - Seeds on `hash(scene_id)` for reproducibility across re-runs
 - For each parameter set × frame, atomically (§3.4):
-  - Computes GT focus map from depth + CoC params
-  - Saves as compressed float16 NPZ (`focus_XXXX.npz`)
-  - Renders bokeh using the same focus map as BokehNet guidance
+  - Computes absolute CoC map and guidance from depth + CoC params
+  - Saves NPZ (`focus_XXXX.npz`) with:
+    - `focus_map`: absolute CoC diameter on sensor (float32, metres)
+    - `guidance_map`: Bokeh guidance (float16, [0,1])
+    - `signed_diopter_map`: signed optical-power error (float32, 1/metres)
+  - Renders bokeh using `guidance_map` (same camera physics)
   - Saves as PNG (`bokeh_XXXX.png`)
 - Uses shared initial latents across frames for temporal consistency
 - Writes `metadata.json` with all CoC parameters including `max_coc`
-- Warns if mean focus map is <0.2 or >0.8 (potentially degenerate)
+- Warns if mean `guidance_map` is <0.2 or >0.8 (potentially degenerate)
 
-**BokehNet conditioning**: The focus map is converted to a defocus map
-(`1 - focus_map`), expanded to 3 channels, and passed as a guidance
+**BokehNet conditioning**: `guidance_map` is converted to defocus
+(`1 - guidance_map`), expanded to 3 channels, and passed as a guidance
 condition to FLUX alongside the sharp frame. The prompt "an excellent
 photo with a large aperture" guides the diffusion at 30 steps.
 
@@ -277,7 +295,8 @@ CPU-only sweep that checks every scene for completeness:
 - Frame counts match across all modalities
 - All NPZ files loadable with correct keys
 - Depth values are positive
-- Focus map values are in [0, 1]
+- `focus_map` values are non-negative (absolute CoC)
+- `guidance_map` values are in [0, 1] when present
 - Spatial dimensions are consistent
 - `metadata.json` contains required keys
 - `split.txt` is valid
@@ -308,14 +327,16 @@ output/{scene_id}/
     .done                               # sentinel
   focus_maps/
     set_00/ ... set_03/
-      focus_0000.npz ... focus_NNNN.npz # key='focus_map', float16, [0,1]
+      focus_0000.npz ... focus_NNNN.npz # keys: focus_map, guidance_map, signed_diopter_map
 ```
 
 **Dataloader loading convention**:
 ```python
-depth = np.load(path)['depth'].astype(np.float32)    # metres
-focus = np.load(path)['focus_map'].astype(np.float32) # [0, 1]
-frame = cv2.imread(str(path))                          # uint8 BGR
+depth = np.load(path)['depth'].astype(np.float32)              # metres
+focus_abs = np.load(path)['focus_map'].astype(np.float32)      # absolute CoC, metres
+guidance = np.load(path)['guidance_map'].astype(np.float32)    # [0,1] (if present)
+diopter = np.load(path)['signed_diopter_map'].astype(np.float32)  # 1/metres (if present)
+frame = cv2.imread(str(path))                                  # uint8 BGR
 ```
 
 The `roi` field is a training-time construct (random crop or saliency region)
@@ -335,17 +356,20 @@ Where:
 - $S_{\text{focus}}$ = focus distance (metres)
 - $d$ = pixel depth (metres)
 
-Normalised CoC and focus map:
+Derived maps:
 
-$$\text{CoC}_{\text{norm}} = \text{clamp}\left(\frac{\text{CoC}(d)}{\text{max\_coc}},\ 0,\ 1\right)$$
+$$\text{focus\_map}_{\text{abs}} = \text{CoC}(d)$$
 
-$$\text{focus\_map} = 1 - \text{CoC}_{\text{norm}}$$
+$$\text{CoC}_{\text{norm}} = \text{clamp}\left(\frac{\max(\text{CoC}(d)-\text{CoC}_{\text{accept}},\ 0)}{\text{max\_coc}},\ 0,\ 1\right)$$
 
-Pixels at the focus plane ($d = S_{\text{focus}}$) get `focus_map = 1` (perfectly
-focused). Pixels far from the focus plane get values approaching 0 (maximum
-defocus). The `max_coc` normalisation constant is calibrated empirically in
-Phase 4 to ensure the distribution of focus map values is well-spread across
-[0, 1] for the actual depth ranges in the dataset.
+$$\text{guidance\_map} = 1 - \left(\text{CoC}_{\text{norm}}\right)^{\gamma}$$
+
+$$\Delta D = \frac{1}{d} - \frac{1}{S_{\text{focus}}}$$
+
+Where `focus_map_abs` is physically comparable across scenes, `guidance_map`
+is the bounded control signal consumed by BokehNet, and $\Delta D$ is signed
+diopter error relative to focus plane. The `max_coc` normalisation constant is
+calibrated empirically in Phase 4.
 
 ### Parameter Sampling
 
@@ -391,6 +415,10 @@ channel provides native aarch64+CUDA wheels validated for GH200.
 - [x] Physics-based CoC calibration in Phase 4 with Beta(2,2) sampling
 - [x] Atomic focus map + BokehNet rendering in Phase 5
 - [x] Comprehensive output validation in Phase 6
+- [x] Phase 4 scene-index lookup made robust for run-scoped output roots
+- [x] Phase 2 now writes run-local `split.txt` metadata for downstream validation
+- [x] Phase 5 switched to absolute focus-map schema (`focus_map`, `guidance_map`, `signed_diopter_map`)
+- [x] One-off migration script added for legacy multi-test focus maps (no bokeh rerender)
 - [x] README.md rewritten with full documentation
 - [x] requirements.txt updated (removed gradio/jupyter/ml-depth-pro, added
   transformers/scipy/rich etc.)

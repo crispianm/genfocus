@@ -32,9 +32,9 @@ export OUT_ROOT=./output/runs/multi_test_${RUN_ID}
 export RAW_ROOT=./data
 export SCENE_INDEX=./output/scene_index.json
 
-SCENE_COUNT=10
-MAX_FRAMES=20
-N_SETS=1
+SCENE_COUNT=1
+MAX_FRAMES=16
+N_SETS=2
 
 echo "======================================================"
 echo " Multi-scene pipeline test"

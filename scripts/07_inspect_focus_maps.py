@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Inspect focus-map distributions for a rendered scene.
 
-This is a lightweight diagnostic to quickly answer:
-- Are focus maps mostly near 0 (everything defocused)?
-- Are they mostly near 1 (everything sharp)?
-- Do different CoC sets vary as expected?
+This is a lightweight diagnostic to inspect absolute and guidance maps:
+- absolute focus_map (CoC on sensor, metres)
+- guidance_map ([0,1], if present)
+- signed_diopter_map (1/metres, if present)
 
 Usage:
     python scripts/07_inspect_focus_maps.py --scene_dir output/bear
@@ -62,20 +62,47 @@ def main() -> None:
 
         n = min(args.sample_frames, len(files))
         idx = np.linspace(0, len(files) - 1, n, dtype=int)
-        samples = []
+        coc_samples = []
+        guidance_samples = []
+        diopter_samples = []
         for i in idx:
-            fm = np.load(files[i])["focus_map"]
-            samples.append(fm)
+            data = np.load(files[i])
+            coc_samples.append(data["focus_map"])
+            if "guidance_map" in data.files:
+                guidance_samples.append(data["guidance_map"])
+            if "signed_diopter_map" in data.files:
+                diopter_samples.append(data["signed_diopter_map"])
 
-        stack = np.stack([s.astype(np.float32) for s in samples], axis=0)
-        stats = summarize(stack)
-        frac_defocused = float((stack < 0.2).mean())
-        frac_sharp = float((stack > 0.8).mean())
+        coc_stack = np.stack([s.astype(np.float32) for s in coc_samples], axis=0)
+        coc_stats = summarize(coc_stack)
+        coc_mm = coc_stack * 1e3
+        coc_mm_stats = summarize(coc_mm)
 
-        print(
-            f"{set_dir.name}: mean={stats['mean']:.3f} p10={stats['p10']:.3f} p50={stats['p50']:.3f} "
-            f"p90={stats['p90']:.3f} frac<0.2={frac_defocused:.3f} frac>0.8={frac_sharp:.3f}"
+        msg = (
+            f"{set_dir.name}: CoC[m] mean={coc_stats['mean']:.6e} p50={coc_stats['p50']:.6e} "
+            f"p90={coc_stats['p90']:.6e} | CoC[mm] p50={coc_mm_stats['p50']:.4f} p90={coc_mm_stats['p90']:.4f}"
         )
+
+        if guidance_samples:
+            g_stack = np.stack([s.astype(np.float32) for s in guidance_samples], axis=0)
+            g_stats = summarize(g_stack)
+            frac_defocused = float((g_stack < 0.2).mean())
+            frac_sharp = float((g_stack > 0.8).mean())
+            msg += (
+                f" | guidance mean={g_stats['mean']:.3f} p10={g_stats['p10']:.3f} "
+                f"p50={g_stats['p50']:.3f} p90={g_stats['p90']:.3f} "
+                f"frac<0.2={frac_defocused:.3f} frac>0.8={frac_sharp:.3f}"
+            )
+
+        if diopter_samples:
+            d_stack = np.stack([s.astype(np.float32) for s in diopter_samples], axis=0)
+            d_stats = summarize(d_stack)
+            msg += (
+                f" | diopter Δ mean={d_stats['mean']:.4f} p10={d_stats['p10']:.4f} "
+                f"p50={d_stats['p50']:.4f} p90={d_stats['p90']:.4f}"
+            )
+
+        print(msg)
 
 
 if __name__ == "__main__":
